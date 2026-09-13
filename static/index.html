@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电缆盘进场与放缆推演</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>电缆盘进场与放缆推演</h1>
+    <p>平面 / 纵剖面描线 · 滚运转向 · 架设牵引 · 首次受阻停帧 · 已核实区段锁定</p>
+  </div>
+  <div class="top-actions">
+    <button id="runBtn" class="primary">▶ 点击推演</button>
+    <button id="continueBtn" class="success" disabled>继续演算</button>
+    <button id="unlockBtn" disabled>解锁返工</button>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="panel left">
+    <section>
+      <h2>1. 绘图工具</h2>
+      <div class="toolgrid">
+        <button data-tool="select" class="tool active">选择/拖放</button>
+        <button data-tool="node" class="tool">追加路线点</button>
+        <button data-tool="gate" class="tool">门洞</button>
+        <button data-tool="turn" class="tool">转弯区</button>
+        <button data-tool="wall" class="tool">画墙/障碍</button>
+        <button data-tool="reel" class="tool">盘架</button>
+        <button data-tool="puller" class="tool">牵引机</button>
+        <button data-tool="guide" class="tool">导向轮</button>
+      </div>
+      <p class="hint">追加路线点会接在当前线形末端；门洞、转弯区请放在路线上。盘架、牵引机、导向轮可直接拖放；画墙时在平面图按下并拖动。</p>
+    </section>
+
+    <section>
+      <h2>2. 基础参数</h2>
+      <div class="form" id="paramForm">
+        <label>盘体外径 D(m)<input type="number" step="0.01" data-k="reelDiameter"></label>
+        <label>盘芯/筒体直径(m)<input type="number" step="0.01" data-k="barrelDiameter"></label>
+        <label>盘体宽度(m)<input type="number" step="0.01" data-k="reelWidth"></label>
+        <label>盘体总重(N)<input type="number" step="100" data-k="totalWeight"></label>
+        <label>电缆外径(m)<input type="number" step="0.001" data-k="cableDiameter"></label>
+        <label>电缆单位重(N/m)<input type="number" step="1" data-k="cableWeight"></label>
+        <label>地面摩擦系数<input type="number" step="0.01" data-k="friction"></label>
+        <label>导轮摩擦系数<input type="number" step="0.01" data-k="rollerFriction"></label>
+        <label>滚运阻力系数<input type="number" step="0.005" data-k="rollingResistance"></label>
+        <label>初始出线张力(N)<input type="number" step="50" data-k="initialTension"></label>
+        <label>允许张力(N)<input type="number" step="100" data-k="allowTension"></label>
+        <label>允许侧压力(N/m)<input type="number" step="100" data-k="allowSidePressure"></label>
+        <label>盘架允许支反力(N)<input type="number" step="1000" data-k="standCapacity"></label>
+        <label>盘架水平锚固限值(N)<input type="number" step="1000" data-k="anchorCapacity"></label>
+        <label>允许坡道制动力(N)<input type="number" step="100" data-k="brakeCapacity"></label>
+        <label>允许最小弯曲半径(m)<input type="number" step="0.05" data-k="minBendRadius"></label>
+        <label>碰墙安全净距(m)<input type="number" step="0.01" data-k="clearanceMargin"></label>
+        <label>默认导轮半径(m)<input type="number" step="0.05" data-k="guideRadius"></label>
+        <label>默认每组导轮数<input type="number" step="1" data-k="guideCount"></label>
+        <label>单只导轮荷载(N)<input type="number" step="100" data-k="guideCapacity"></label>
+        <label>牵引机额定(N)<input type="number" step="100" data-k="pullerCapacity"></label>
+        <label>分段后起始张力(N)<input type="number" step="50" data-k="pullerBackTension"></label>
+        <label>竖井深度(m)<input type="number" step="0.5" data-k="shaftDepth"></label>
+        <label>井口导向半径(m)<input type="number" step="0.05" data-k="shaftSheaveRadius"></label>
+      </div>
+    </section>
+
+    <section id="objectEditorSection">
+      <h2>3. 对象参数</h2>
+      <div id="objectEditor" class="object-editor">
+        <p class="muted">在平面或纵剖面中选择节点、墙或设备。</p>
+      </div>
+    </section>
+  </aside>
+
+  <section class="stage">
+    <div class="canvas-card">
+      <div class="canvas-head">
+        <div><h2>平面：门洞、坡道、转弯区、井口与设备</h2><span id="planStatus" class="statusline">坐标单位：m</span></div>
+        <div class="legend">
+          <span><i style="background:#16a34a"></i>已核实</span>
+          <span><i style="background:#2563eb"></i>算通</span>
+          <span><i style="background:#94a3b8"></i>待算</span>
+          <span><i style="background:#dc2626"></i>受阻</span>
+        </div>
+      </div>
+      <div id="planWrap" class="svg-wrap">
+        <svg id="planSvg" viewBox="0 0 42 26" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+    </div>
+    <div class="canvas-card">
+      <div class="canvas-head">
+        <div><h2>纵剖面：坡道高程与井口</h2><span class="statusline">拖动圆点调整高程；坡度按相邻平面距离计算</span></div>
+      </div>
+      <canvas id="profileCanvas" width="1080" height="260"></canvas>
+    </div>
+    <div class="telemetry">
+      <div><label>当前步骤</label><strong id="teleTitle">未推演</strong></div>
+      <div><label>里程</label><strong id="teleStation">-</strong></div>
+      <div><label>累计张力</label><strong id="teleTension">-</strong></div>
+      <div><label>弯曲半径</label><strong id="teleRadius">-</strong></div>
+      <div><label>弯道侧压力</label><strong id="teleSide">-</strong></div>
+      <div><label>盘架反力</label><strong id="teleStand">-</strong></div>
+      <div><label>坡道制动力</label><strong id="teleBrake">-</strong></div>
+      <div><label>状态</label><strong id="teleState">-</strong></div>
+    </div>
+    <div id="messageBar" class="message info">先描出门洞、坡道与转弯路径，拖入盘架、牵引机和导向轮后点击“点击推演”。</div>
+  </section>
+
+  <aside class="panel right">
+    <section>
+      <h2>4. 逐段结果</h2>
+      <div class="playcontrols">
+        <button id="pauseBtn" disabled>⏸ 暂停</button>
+        <button id="stepBtn" disabled="disabled">单步</button>
+        <label>速度<input id="speedInput" type="range" min="0.5" max="3" step="0.1" value="1"></label>
+      </div>
+      <ol id="checkpointList" class="checkpoints"></ol>
+    </section>
+    <section>
+      <h2>5. 归档与输出</h2>
+      <label>版本名称<input id="archiveName" placeholder="例如：三号竖井左线-首盘-20260913"></label>
+      <label>人工说明<textarea id="archiveNote" rows="4" placeholder="记录现场复测、设备编号、交底人、异常处理等"></textarea></label>
+      <button id="archiveBtn" class="primary wide">归档当前版本（后端复算）</button>
+      <div class="outputs">
+        <button id="stepsBtn" disabled>输出步骤单 .md</button>
+        <button id="svgBtn" disabled>输出标色路径 .svg</button>
+        <button id="jsonBtn" disabled>输出复算 .json</button>
+      </div>
+      <div id="archiveList" class="archive-list"></div>
+    </section>
+  </aside>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
