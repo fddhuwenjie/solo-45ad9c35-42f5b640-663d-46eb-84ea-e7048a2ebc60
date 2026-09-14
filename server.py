@@ -121,10 +121,11 @@ def segment_distance(x1, y1, x2, y2, x3, y3, x4, y4):
     return math.sqrt(min(vals))
 
 
-def rect_segment_distance(cx, cy, ex, ey, hx, hy, wall):
+def rect_segment_distance(cx, cy, ex, ext, hx, hwt, wall):
     """OBB 矩形与墙线段的净距。
 
-    ex/ey：出线方向半长轴；hx/hy：盘轴方向半长轴。
+    ex：出线方向单位轴；ext：沿出线方向的半长；
+    hx：盘轴方向单位轴；hwt：盘轴方向半宽。
     """
     x1, y1, x2, y2 = wall["x1"], wall["y1"], wall["x2"], wall["y2"]
 
@@ -134,12 +135,6 @@ def rect_segment_distance(cx, cy, ex, ey, hx, hy, wall):
 
     l1 = to_local(x1, y1)
     l2 = to_local(x2, y2)
-    corners = [(-hx, -hy), (ex, -hy), (ex, hy), (-hx, hy)]
-    # 上面变量仅作尺寸占位，实际用半长重建角点。
-    exl, eyl = ex
-    hxl, hyl = hx
-    ext = math.hypot(exl, eyl)
-    hwt = math.hypot(hxl, hyl)
     corners = [(-ext, -hwt), (ext, -hwt), (ext, hwt), (-ext, hwt)]
 
     def inside(lx, ly):
@@ -592,8 +587,10 @@ def simulate(scenario, locked_count=0, verified_hashes=None):
     else:
         tan = reel_proj["tangent"]
         tangent_deg = math.degrees(math.atan2(tan[1], tan[0]))
-        delta = abs(wrap_angle(math.radians(num(reel.get("payoutAngle")) - math.radians(tangent_deg))))
-        delta = math.degrees(delta)
+        payout_deg = num(reel.get("payoutAngle"))
+        # 有向夹角：出线方向须与朝井口的路线切线同向；
+        # 注意度数相减后只能包一次 radians，不能再嵌套 radians。
+        delta = math.degrees(abs(wrap_angle(math.radians(payout_deg - tangent_deg))))
         if delta > 100:
             setup_msg = "盘架出线方向摆反（偏差 %.0f°），电缆将在竖井口形成扭转。" % delta
             severity = "error"
@@ -618,10 +615,11 @@ def simulate(scenario, locked_count=0, verified_hashes=None):
         exv = (math.cos(math.radians(num(reel.get("payoutAngle")))),
                math.sin(math.radians(num(reel.get("payoutAngle")))))
         hxv = (-exv[1], exv[0])
+        half_l = p["reelDiameter"] / 2
+        half_w = p["reelWidth"] / 2
         for wall in walls:
-            d = rect_segment_distance(reel_proj["x"], reel_proj["y"], exv,
-                                      (p["reelDiameter"] / 2, 0), hxv,
-                                      (p["reelWidth"] / 2, 0), wall)
+            d = rect_segment_distance(reel_proj["x"], reel_proj["y"],
+                                      exv, half_l, hxv, half_w, wall)
             if d < p["clearanceMargin"]:
                 setup_msg = "架设后盘体转动范围碰墙，净距 %.2fm。" % d
                 severity = "error"
@@ -649,11 +647,26 @@ def simulate(scenario, locked_count=0, verified_hashes=None):
         return stopped
 
     # 3) 牵引放缆
-    def update_stand(grade, t):
+    def update_stand(grade, t, target=None):
         react = stand_reactions(p, grade, t)
-        m = metrics
-        m["standReaction"] = react["max"]
-        m["standHorizontal"] = react["horizontal"]
+        mm = target if target is not None else metrics
+        mm["standReaction"] = react["max"]
+        mm["standLimit"] = p["standCapacity"]
+        mm["standHorizontal"] = react["horizontal"]
+        return react
+
+    def stand_overload(react):
+        """盘架反力首次越限判定；责任对象固定为盘架。"""
+        if react["min"] < 0:
+            return ("盘架支腿出现负反力 %.0fN（翘腿），盘架过载，限值 %.0fN。"
+                    % (react["min"], p["standCapacity"]))
+        if react["max"] > p["standCapacity"]:
+            return ("盘架支反力 %.1fN 超过盘架允许值 %.0fN，盘架过载。"
+                    % (react["max"], p["standCapacity"]))
+        if react["horizontal"] > p["anchorCapacity"]:
+            return ("盘架水平锚固力 %.0fN 超过限值 %.0fN。"
+                    % (react["horizontal"], p["anchorCapacity"]))
+        return ""
 
     def straight_span(sec, a, b):
         nonlocal tension, metrics
@@ -669,12 +682,20 @@ def simulate(scenario, locked_count=0, verified_hashes=None):
         m = json.loads(json.dumps(metrics))
         m.update({"tensionBefore": t0, "tension": tension,
                   "slope": grade, "length": slope_len})
-        update_stand(grade, tension)
-        metrics = m
+        react = update_stand(grade, tension, m)
+        stand_msg = stand_overload(react)
+        # 失败段不把越限指标写回共享状态，避免后续分段点覆盖本检查点数值。
+        if not stand_msg and tension <= p["allowTension"]:
+            metrics = m
         msg = ""
         resp = pullers_ahead[-1]["obj"]["id"] if pullers_ahead else reel["id"]
+        rtype = "equipment"
         status, severity = "success", "info"
-        if tension > p["allowTension"]:
+        if stand_msg:
+            msg = stand_msg
+            status, severity = "failed", "error"
+            resp, rtype = reel["id"], "equipment"
+        elif tension > p["allowTension"]:
             msg = "累计张力 %.0fN 超过允许张力 %.0fN。" % (tension, p["allowTension"])
             status, severity = "failed", "error"
         elif abs(grade) >= 5:
@@ -688,7 +709,7 @@ def simulate(scenario, locked_count=0, verified_hashes=None):
         ])
         cp = make_checkpoint("pull:straight:%s:%.1f" % (sec["edge"], a),
                              "pull", "牵引直线/坡道段", a, b, h, m,
-                             resp, "equipment", msg, status, severity)
+                             resp, rtype, msg, status, severity)
         return finish(cp, status == "failed")
 
     def arc_span(sec, a, b):
@@ -732,7 +753,7 @@ def simulate(scenario, locked_count=0, verified_hashes=None):
                 m.update({"tensionBefore": t0, "tension": tension,
                           "bendRadius": radius, "sidePressure": side,
                           "radialLoad": radial, "wheelLoad": wheel_load})
-                update_stand(0, tension)
+                react = update_stand(0, tension, m)
                 if radius < p["minBendRadius"]:
                     status, severity = "failed", "error"
                     msg = "弯曲半径 %.2fm 小于电缆允许半径 %.2fm。" % (radius, p["minBendRadius"])
@@ -746,21 +767,39 @@ def simulate(scenario, locked_count=0, verified_hashes=None):
                     msg = "单只导向轮受力 %.0fN 超过额定 %.0fN。" % (
                         wheel_load, num(g.get("capacity"), p["guideCapacity"]))
                     resp, rtype = g["id"], "equipment"
-                elif tension > p["allowTension"]:
-                    status, severity = "failed", "error"
-                    msg = "弯后累计张力 %.0fN 超过允许张力 %.0fN。" % (tension, p["allowTension"])
-                    resp, rtype = g["id"], "equipment"
                 else:
-                    msg = "弯段 θ=%.0f° R=%.2fm，导向轮×%d，张力 %.0fN，侧压 %.0fN/m。" % (
-                        math.degrees(theta), radius, count, tension, side)
+                    stand_msg = stand_overload(react)
+                    if stand_msg:
+                        status, severity = "failed", "error"
+                        msg = stand_msg
+                        resp, rtype = reel["id"], "equipment"
+                    elif tension > p["allowTension"]:
+                        status, severity = "failed", "error"
+                        msg = "弯后累计张力 %.0fN 超过允许张力 %.0fN。" % (tension, p["allowTension"])
+                        resp, rtype = g["id"], "equipment"
+                    else:
+                        msg = "弯段 θ=%.0f° R=%.2fm，导向轮×%d，张力 %.0fN，侧压 %.0fN/m。" % (
+                            math.degrees(theta), radius, count, tension, side)
         else:
             tension = t0 * math.exp(p["friction"] * theta)
             side = tension / sec["radius"]
             m.update({"tensionBefore": t0, "tension": tension,
                       "sidePressure": side})
-            msg = "小微弯未设导向轮，按摩擦 %.2f 复算。" % p["friction"]
+            react = update_stand(0, tension, m)
+            stand_msg = stand_overload(react)
+            if stand_msg:
+                status, severity = "failed", "error"
+                msg = stand_msg
+                resp, rtype = reel["id"], "equipment"
+            elif tension > p["allowTension"]:
+                status, severity = "failed", "error"
+                msg = "弯后累计张力 %.0fN 超过允许张力 %.0fN。" % (tension, p["allowTension"])
+                resp, rtype = turn_node["id"], "node"
+            else:
+                msg = "小微弯未设导向轮，按摩擦 %.2f 复算。" % p["friction"]
 
-        metrics = m
+        if status != "failed":
+            metrics = m
         h = stable_hash([
             "pull-arc", sec["turn"], round(sec["radius"], 3), round(sec["sweep"], 5),
             assigned and {
@@ -857,10 +896,14 @@ def simulate(scenario, locked_count=0, verified_hashes=None):
             tension += p["cableWeight"] * p["shaftDepth"]
         m.update({"tensionBefore": t0, "tension": tension, "bendRadius": radius,
                   "sidePressure": side, "radialLoad": radial, "length": p["shaftDepth"]})
-        update_stand(alpha, tension)
+        react = update_stand(alpha, tension, m)
+        stand_msg = stand_overload(react)
         if side > p["allowSidePressure"]:
             status, severity = "failed", "error"
             msg = "井口侧压力 %.0fN/m 超限。" % side
+        elif stand_msg:
+            status, severity = "failed", "error"
+            msg = stand_msg
         elif tension > p["allowTension"]:
             status, severity = "failed", "error"
             msg = "竖井终点张力 %.0fN 超过允许张力 %.0fN。" % (tension, p["allowTension"])
