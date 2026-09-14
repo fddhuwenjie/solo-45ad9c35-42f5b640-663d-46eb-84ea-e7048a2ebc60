@@ -17,7 +17,13 @@
         brakeCapacity: 12000, minBendRadius: 1.7, clearanceMargin: 0.1,
         guideRadius: 0.75, guideCount: 4, guideCapacity: 6000,
         pullerCapacity: 18000, pullerBackTension: 300,
-        shaftDepth: 12, shaftSheaveRadius: 1.8
+        shaftDepth: 12, shaftSheaveRadius: 1.8,
+        // 放盘—牵引瞬态联动
+        emptyInertia: 520, bearingTorque: 260, reserveCable: 60,
+        axialStiffness: 4000000, slackClearance: 1.5,
+        brakeMaxSpeed: 12, brakeHeatCapacity: 260000,
+        brakeWindingPack: 0.85, transientStartSpeed: 0,
+        transientDuration: 26, transientDt: 0.1
       },
       nodes: [
         { id: "n0", type: "start", x: 3, y: 20, z: 0 },
@@ -1028,7 +1034,22 @@
     if (state.result && state.lockedCount === 0) state.result = null;
     state.currentArchiveId = null;
     ["stepsBtn", "svgBtn", "jsonBtn"].forEach(function (id) { $(id).disabled = true; });
+    document.dispatchEvent(new CustomEvent("rigging:scenario-changed"));
   }
+
+  // 供“放盘—牵引联动”工作区（transient.js）共享同一份场景
+  window.RiggingScenario = {
+    get: function () { return state.scenario; },
+    set: function (sc) {
+      state.scenario = sc;
+      state.result = null;
+      state.lockedCount = 0;
+      state.verifiedHashes = [];
+      renderParamForm();
+      renderAll();
+      document.dispatchEvent(new CustomEvent("rigging:scenario-changed"));
+    }
+  };
 
   // --------------------------- 归档 ---------------------------
   function archiveCurrent() {

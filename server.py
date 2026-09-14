@@ -24,7 +24,16 @@ FLOAT_FIELDS = [
     "guideRadius", "guideCount", "guideCapacity",
     "pullerCapacity", "pullerBackTension", "shaftDepth",
     "shaftSheaveRadius",
+    # 放盘—牵引瞬态联动参数
+    "emptyInertia", "bearingTorque", "reserveCable", "axialStiffness",
+    "slackClearance", "brakeMaxSpeed", "brakeHeatCapacity",
+    "brakeWindingPack", "transientStartSpeed", "transientDuration",
+    "transientDt",
 ]
+
+GRAVITY = 9.81
+DEFAULT_BRAKE_CURVE = [[0.0, 0.0], [0.25, 1400.0], [0.5, 3000.0],
+                       [0.75, 5000.0], [1.0, 7500.0]]
 
 
 # ----------------------------- 通用工具 -----------------------------
@@ -181,6 +190,18 @@ def get_params(scenario):
         "pullerBackTension": 300.0,
         "shaftDepth": 12.0,
         "shaftSheaveRadius": 1.8,
+        # 放盘—牵引瞬态联动默认值（空盘惯量按盘体重心估算给出）
+        "emptyInertia": 520.0,
+        "bearingTorque": 260.0,
+        "reserveCable": 60.0,
+        "axialStiffness": 4.0e6,
+        "slackClearance": 1.5,
+        "brakeMaxSpeed": 12.0,
+        "brakeHeatCapacity": 260000.0,
+        "brakeWindingPack": 0.85,
+        "transientStartSpeed": 0.0,
+        "transientDuration": 30.0,
+        "transientDt": 0.1,
     }
     for key, val in defaults.items():
         p[key] = num(raw.get(key), val)
@@ -926,6 +947,508 @@ def simulate(scenario, locked_count=0, verified_hashes=None):
             "warnings": warnings, "geometry": geometry_brief()}
 
 
+# ----------------------------- 放盘—牵引瞬态联动 -----------------------------
+
+# 冲突判定固定顺序：同一时刻多项越限时，回放停在排序最前者。
+TRANSIENT_CONFLICTS = [
+    ("tension", "拉力超标"),
+    ("heat", "制动储热不足"),
+    ("overspeed", "盘轴超速"),
+    ("reserve", "余缆耗尽"),
+    ("slack", "松弛圈超出净空"),
+]
+
+
+def get_transient_conf(raw, p):
+    """从 scenario.params + transient 覆盖项取瞬态配置。"""
+    raw = raw or {}
+
+    def pick(key):
+        return num(raw.get(key), p[key])
+
+    return {
+        "emptyInertia": pick("emptyInertia"),
+        "bearingTorque": pick("bearingTorque"),
+        "reserveCable": pick("reserveCable"),
+        "axialStiffness": pick("axialStiffness"),
+        "slackClearance": pick("slackClearance"),
+        "brakeMaxSpeed": pick("brakeMaxSpeed"),
+        "brakeHeatCapacity": pick("brakeHeatCapacity"),
+        "windingPack": num(raw.get("brakeWindingPack"), p["brakeWindingPack"]),
+        "startSpeed": num(raw.get("startSpeed"), p["transientStartSpeed"]),
+        "duration": max(0.1, num(raw.get("duration"), p["transientDuration"])),
+        "dt": clamp(num(raw.get("dt"), p["transientDt"]), 0.01, 1.0),
+        "brakeCurve": normalize_curve(raw.get("brakeCurve"), DEFAULT_BRAKE_CURVE),
+    }
+
+
+def normalize_curve(value, default):
+    """制动器指令—扭矩曲线：[[指令0~1, 扭矩N·m], ...]，按指令排序。"""
+    pts = []
+    for item in value or []:
+        try:
+            x, y = float(item[0]), float(item[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        pts.append([clamp(x, 0.0, 1.5), max(0.0, y)])
+    pts.sort(key=lambda q: q[0])
+    return pts if len(pts) >= 2 else [list(q) for q in default]
+
+
+def brake_torque_at(curve, cmd):
+    """分段线性插值，超界取端点。"""
+    if cmd <= curve[0][0]:
+        return curve[0][1]
+    for i in range(1, len(curve)):
+        if cmd <= curve[i][0] or i == len(curve) - 1:
+            x0, y0 = curve[i - 1]
+            x1, y1 = curve[i]
+            if x1 == x0:
+                return y1
+            f = clamp((cmd - x0) / (x1 - x0), 0.0, 1.0)
+            return y0 + (y1 - y0) * f
+    return curve[-1][1]
+
+
+def wound_radius(reserve, conf, p):
+    """余缆在筒体上的卷绕半径：r² = r筒² + L·d²/(4·装填系数)。"""
+    barrel_r = max(p["barrelDiameter"] / 2.0, 0.05)
+    d2 = p["cableDiameter"] ** 2
+    r2 = barrel_r ** 2 + max(0.0, reserve) * d2 / (4.0 * max(conf["windingPack"], 0.05))
+    return math.sqrt(r2)
+
+
+def snap_grid(t, dt):
+    return round(round(t / dt) * dt, 6)
+
+
+def normalize_keyframes(kfs, dt, duration):
+    out = []
+    for raw in kfs or []:
+        k = dict(raw or {})
+        if k.get("type") not in ("speed", "jog", "estop"):
+            k["type"] = "speed"
+        t = snap_grid(clamp(num(k.get("time"), 0.0), 0.0, duration), dt)
+        k["time"] = t
+        k["speed"] = num(k.get("speed"), 0.0)
+        b = k.get("brake")
+        k["brake"] = None if b is None or b == "" else clamp(num(b), 0.0, 1.0)
+        k["ramp"] = max(0.0, num(k.get("ramp"), -1.0))
+        k["hold"] = max(0.0, num(k.get("hold"), 1.0))
+        k["id"] = str(k.get("id") or ("kf-%d" % (len(out) + 1)))
+        out.append(k)
+    out.sort(key=lambda q: q["time"])
+    return out
+
+
+def build_commands(keyframes, conf):
+    """把关键帧展开为指令速度折线点与制动阶跃点；时间吸附到积分网格。"""
+    dt, duration = conf["dt"], conf["duration"]
+    speed_pts = [(0.0, conf["startSpeed"], None)]
+    brake_pts = []  # (t, 指令, 关键帧id)，阶跃保持
+
+    def speed_now(t):
+        return piecewise_linear(speed_pts, t)
+
+    for k in keyframes:
+        t0 = k["time"]
+        if k["type"] == "speed":
+            ramp = k["ramp"] if k["ramp"] >= 0 else 0.8
+            t1 = snap_grid(min(duration, t0 + ramp), dt)
+            v0 = speed_now(t0)
+            if t0 > speed_pts[-1][0] + 1e-9:
+                speed_pts.append((t0, v0, None))
+            speed_pts.append((max(t0, t1), k["speed"], k["id"]))
+            if k["brake"] is not None:
+                brake_pts.append((t0, k["brake"], k["id"]))
+        elif k["type"] == "jog":
+            ramp = k["ramp"] if k["ramp"] >= 0 else 0.3
+            t1 = snap_grid(min(duration, t0 + ramp), dt)
+            t2 = snap_grid(min(duration, t1 + max(k["hold"], 0.05)), dt)
+            t3 = snap_grid(min(duration, t2 + ramp), dt)
+            v0 = speed_now(t0)
+            if t0 > speed_pts[-1][0] + 1e-9:
+                speed_pts.append((t0, v0, None))
+            speed_pts.append((t1, k["speed"], k["id"]))       # 点动升速（斜坡）
+            speed_pts.append((t2, k["speed"], k["id"]))       # 保持
+            speed_pts.append((t3, v0, k["id"]))               # 回落（斜坡）
+            if k["brake"] is not None:
+                brake_pts.append((t0, k["brake"], k["id"]))
+        else:  # 急停：指令速度在 ramp 内归零，制动指令置 100%（直至下一次换速/点动解除）
+            ramp = k["ramp"] if k["ramp"] >= 0 else 0.25
+            t1 = snap_grid(min(duration, t0 + ramp), dt)
+            v0 = speed_now(t0)
+            if t0 > speed_pts[-1][0] + 1e-9:
+                speed_pts.append((t0, v0, None))
+            speed_pts.append((max(t0, t1), 0.0, k["id"]))
+            brake_pts.append((t0, 1.0, k["id"]))
+            # 之后任何换速/点动关键帧视为复位急停，制动指令归零
+            for later in keyframes:
+                if later["time"] > t0 and later["type"] in ("speed", "jog"):
+                    brake_pts.append((later["time"], 0.0, later["id"]))
+                    break
+    speed_pts.sort(key=lambda q: q[0])
+    brake_pts.sort(key=lambda q: q[0])
+    return speed_pts, brake_pts
+
+
+def piecewise_linear(pts, t):
+    if t <= pts[0][0]:
+        return pts[0][1]
+    for i in range(1, len(pts)):
+        if t <= pts[i][0] or i == len(pts) - 1:
+            t0, v0 = pts[i - 1][0], pts[i - 1][1]
+            t1, v1 = pts[i][0], pts[i][1]
+            if t1 <= t0:
+                return v1
+            f = clamp((t - t0) / (t1 - t0), 0.0, 1.0)
+            return v0 + (v1 - v0) * f
+    return pts[-1][1]
+
+
+def brake_cmd_at(brake_pts, t):
+    cmd = 0.0
+    for bt, bc, _ in brake_pts:
+        if bt <= t + 1e-9:
+            cmd = bc
+        else:
+            break
+    return cmd
+
+
+def transient_geometry(scenario):
+    """复用静力线形，求盘架、首台下游牵引机里程与轴向有效长度。"""
+    nodes = scenario.get("nodes") or []
+    equipment = scenario.get("equipment") or []
+    out = {"reelStation": None, "pullerStation": None, "pullerId": None,
+           "reelId": None, "totalStation": None}
+    if len(nodes) < 2:
+        return out
+    try:
+        sections, _, total, _ = build_alignment(nodes)
+    except Exception:
+        return out
+    reel = next((e for e in equipment if e.get("type") == "reel"), None)
+    if not reel:
+        return out
+    rp = project_point(sections, num(reel.get("x")), num(reel.get("y")))
+    out.update({"reelStation": rp["station"], "reelId": reel.get("id"),
+                "totalStation": total})
+    ahead = []
+    for e in equipment:
+        if e.get("type") != "puller":
+            continue
+        pr = project_point(sections, num(e.get("x")), num(e.get("y")))
+        if pr["station"] > rp["station"]:
+            ahead.append((pr["station"], e.get("id")))
+    if ahead:
+        ahead.sort()
+        out["pullerStation"], out["pullerId"] = ahead[0]
+    return out
+
+
+def build_intervals(keyframes, conf):
+    """按关键帧时刻（含点动脉冲结束时刻）切分时间轴区间。"""
+    dt, duration = conf["dt"], conf["duration"]
+    bounds = {0.0, snap_grid(duration, dt)}
+    for k in keyframes:
+        bounds.add(k["time"])
+        if k["type"] == "jog":
+            ramp = k["ramp"] if k["ramp"] >= 0 else 0.3
+            end = snap_grid(min(duration, k["time"] + 2 * ramp + max(k["hold"], 0.05)), dt)
+            bounds.add(end)
+    bounds = sorted(b for b in bounds if 0.0 - 1e-9 <= b <= duration + 1e-9)
+    intervals = []
+    for i in range(len(bounds) - 1):
+        a, b = bounds[i], bounds[i + 1]
+        if b - a < dt / 2 - 1e-9:
+            continue
+        kf = next((k for k in keyframes if abs(k["time"] - a) <= dt / 2), None)
+        if kf:
+            key, kid = kf["id"], kf["id"]
+        elif b >= duration - 1e-9:
+            prev = keyframes[-1] if keyframes else None
+            key, kid = "tail", prev["id"] if prev else None
+        else:
+            nxt = next((k for k in keyframes if k["time"] >= b - 1e-9), None)
+            key, kid = "hold:" + (nxt["id"] if nxt else "end"), nxt["id"] if nxt else None
+        intervals.append({"index": len(intervals), "start": round(a, 3),
+                          "end": round(b, 3), "key": key, "keyframeId": kid})
+    return intervals
+
+
+def transient_global_digest(conf, p, geom, keyframes):
+    return [
+        "transient-v1",
+        round(conf["emptyInertia"], 4), round(conf["bearingTorque"], 4),
+        round(conf["reserveCable"], 4), round(conf["axialStiffness"], 4),
+        round(conf["slackClearance"], 4), round(conf["brakeMaxSpeed"], 5),
+        round(conf["brakeHeatCapacity"], 2), round(conf["windingPack"], 4),
+        round(conf["startSpeed"], 4), round(conf["duration"], 3), round(conf["dt"], 4),
+        conf["brakeCurve"],
+        round(p["cableDiameter"], 5), round(p["cableWeight"], 4),
+        round(p["barrelDiameter"], 4), round(p["initialTension"], 3),
+        round(p["allowTension"], 3),
+        geom.get("reelStation"), geom.get("pullerStation"),
+        [{"id": k["id"], "type": k["type"]} for k in keyframes],
+    ]
+
+
+def interval_hash(interval, keyframes, conf, p, geom):
+    kf = next((k for k in keyframes if k["id"] == interval["keyframeId"]), None)
+    payload = {
+        "g": transient_global_digest(conf, p, geom, keyframes),
+        "key": interval["key"], "from": interval["start"], "to": interval["end"],
+        "kf": ({"id": kf["id"], "type": kf["type"], "time": kf["time"],
+                "speed": kf["speed"], "brake": kf["brake"],
+                "ramp": kf["ramp"], "hold": kf["hold"]} if kf else None),
+    }
+    return stable_hash(payload)
+
+
+def integrate_transient(conf, p, geom, keyframes, speed_pts, brake_pts,
+                        start_time=0.0, start_state=None):
+    """半显式逐时积分；返回逐时行、冲突、结束状态。"""
+    dt = conf["dt"]
+    duration = conf["duration"]
+    base_t = p["initialTension"]
+    linear_mass = max(p["cableWeight"] / GRAVITY, 0.01)
+
+    reel_station = geom.get("reelStation") or 0.0
+    puller_station = geom.get("pullerStation")
+    if puller_station is not None and puller_station > reel_station:
+        span = max(puller_station - reel_station, 1.0)
+    else:
+        span = 10.0
+    k_eff = max(conf["axialStiffness"] / span, 1.0)
+
+    if start_state:
+        st = {k: num(start_state.get(k), 0.0) for k in
+              ("omega", "slack", "reserve", "tension", "heat", "energy", "paidOut")}
+        st["reserve"] = num(start_state.get("reserve"), conf["reserveCable"])
+    else:
+        r0 = wound_radius(conf["reserveCable"], conf, p)
+        omega0 = conf["startSpeed"] / max(r0, 1e-6)
+        st = {"omega": omega0, "slack": 0.0, "reserve": conf["reserveCable"],
+              "tension": base_t, "heat": 0.0, "energy": 0.0, "paidOut": 0.0}
+
+    rows = []
+    n_steps = int(round((duration - start_time) / dt))
+    conflict = None
+
+    for i in range(n_steps + 1):
+        t = round(start_time + i * dt, 6)
+        reserve = max(0.0, st["reserve"])
+        radius = wound_radius(reserve, conf, p)
+        v = st["omega"] * radius
+        vcmd = piecewise_linear(speed_pts, t)
+        brake_cmd = brake_cmd_at(brake_pts, t)
+        brake_m = brake_torque_at(conf["brakeCurve"], brake_cmd)
+        i_rot = conf["emptyInertia"] + linear_mass * reserve * radius ** 2
+        resist = brake_m + conf["bearingTorque"]
+        sgn = 1.0 if st["omega"] >= 0 else -1.0
+
+        # 隐式向后欧拉联立，避免显式弹簧—惯量自激振荡：
+        # ω' = ω + dt·(T'·r − sgn·M阻)/I
+        # T' = T + k·dt·(vcmd − ω'·r)（绷紧时）
+        denom = 1.0 + k_eff * dt * dt * radius ** 2 / i_rot
+        stuck = abs(st["omega"]) < 1e-7 and vcmd <= 1e-9 \
+            and st["tension"] * radius <= brake_m + conf["bearingTorque"] + 1e-9
+
+        if stuck:
+            # 静阻力矩锁止：盘轴不转不放线，张力保持，无瞬态附加张力。
+            tension, alpha = st["tension"], 0.0
+        elif st["slack"] > 1e-9:
+            slack_new = st["slack"] - (vcmd - v) * dt
+            if slack_new > 0.0:
+                # 电缆松弛：盘轴不受缆张力驱动，仅轴承阻力/制动滑行。
+                st["slack"] = slack_new
+                tension = base_t
+                alpha = -resist / i_rot
+                st["omega"] = max(0.0, st["omega"] + alpha * dt)
+            else:
+                # 本时步内松弛耗尽、电缆重新绷紧；以基线张力起步，
+                # 对剩余时长按隐式联立求解，dv 取本时步末真实速度差。
+                st["slack"] = 0.0
+                t_star = base_t + k_eff * dt * (vcmd - v) \
+                    + k_eff * dt * dt * (base_t * radius - resist) * radius / i_rot
+                tension = max(base_t, t_star / denom)
+                alpha = (tension * radius - resist) / i_rot
+                st["omega"] = max(0.0, st["omega"] + alpha * dt)
+        else:
+            t_star = st["tension"] + k_eff * dt * (vcmd - v) \
+                + k_eff * dt * dt * (st["tension"] * radius - resist) * radius / i_rot
+            tension = t_star / denom
+            if tension < base_t:
+                st["slack"] += (base_t - tension) / k_eff
+                tension = base_t
+            alpha = (tension * radius - resist) / i_rot
+            st["omega"] = max(0.0, st["omega"] + alpha * dt)
+        inertia_force = i_rot * alpha / max(radius, 1e-6)
+        if stuck or abs(st["omega"]) < 1e-7:
+            inertia_force = 0.0  # 静止锁止时不展示惯性附加张力
+        v_after = st["omega"] * radius
+
+        rows.append({
+            "t": round(t, 3),
+            "radius": round(radius, 4),
+            "omega": round(st["omega"], 4),
+            "rpm": round(abs(st["omega"]) * 60.0 / (2 * math.pi), 1),
+            "vCmd": round(vcmd, 4),
+            "vReel": round(v_after, 4),
+            "dv": round(vcmd - v_after, 4),
+            "tension": round(tension, 1),
+            "inertiaTension": round(max(0.0, inertia_force), 1),
+            "brakeCmd": round(brake_cmd, 3),
+            "brakeTorque": round(brake_m, 1),
+            "brakeEnergy": round(st["energy"], 1),
+            "brakeHeat": round(st["heat"], 1),
+            "heatRatio": round(st["heat"] / max(conf["brakeHeatCapacity"], 1.0), 3),            "slack": round(st["slack"], 3),
+            "reserve": round(reserve, 3),
+            "paidOut": round(st["paidOut"], 3),
+            "station": round(reel_station + max(0.0, st["paidOut"]), 3),
+        })
+        st["tension"] = tension
+
+        if i < n_steps:
+            st["energy"] += brake_m * abs(st["omega"]) * dt
+            st["heat"] = st["energy"]  # 无冷却假设：制动耗能全部储热（偏安全）
+            st["paidOut"] += st["omega"] * radius * dt
+            st["reserve"] = conf["reserveCable"] - st["paidOut"]
+
+        checks = [
+            ("tension", tension > p["allowTension"], "reel",
+             "瞬时张力 %.0fN 超过允许张力 %.0fN（放线跟不上，惯性附加张力 %.0fN）。" % (
+                 tension, p["allowTension"], max(0.0, inertia_force))),
+            ("heat", st["heat"] > conf["brakeHeatCapacity"], "reel",
+             "制动器累计储热 %.0fJ 超过热容量 %.0fJ（%.0f%%）。" % (
+                 st["heat"], conf["brakeHeatCapacity"],
+                 100.0 * st["heat"] / max(conf["brakeHeatCapacity"], 1.0))),
+            ("overspeed", abs(st["omega"]) > conf["brakeMaxSpeed"], "reel",
+             "盘轴转速 %.2frad/s（%.0fr/min）超过制动器转速上限 %.2frad/s。" % (
+                 st["omega"], abs(st["omega"]) * 60.0 / (2 * math.pi),
+                 conf["brakeMaxSpeed"])),
+            ("reserve", reserve <= 1e-6 and vcmd > 1e-6, "reel",
+             "初始余缆 %.1fm 已在 t=%.1fs 耗尽，牵引机仍在收线。" % (
+                 conf["reserveCable"], t)),
+            ("slack", st["slack"] > conf["slackClearance"], "reel",
+             "盘轴惯性甩出松弛圈 %.2fm，超出盘前净空允许 %.2fm。" % (
+                 st["slack"], conf["slackClearance"])),
+        ]
+        hit = next((c for c in checks if c[1]), None)
+        if hit:
+            kind, _, who, message = hit
+            conflict = {
+                "kind": kind, "title": dict(TRANSIENT_CONFLICTS)[kind],
+                "time": round(t, 3), "message": message,
+                "responsibleId": geom.get("reelId") if who == "reel" else geom.get("pullerId"),
+                "responsibleType": "equipment",
+                "pullerId": geom.get("pullerId"),
+                "reelId": geom.get("reelId"),
+                "station": rows[-1]["station"],
+                "metrics": rows[-1],
+            }
+            break
+
+    end_state = {"t": rows[-1]["t"], "omega": st["omega"], "slack": st["slack"],
+                 "reserve": max(0.0, st["reserve"]), "tension": st["tension"],
+                 "heat": st["heat"], "energy": st["energy"], "paidOut": st["paidOut"]}
+    return rows, conflict, end_state
+
+
+def simulate_transient(data):
+    scenario = data.get("scenario") or {}
+    tr = data.get("transient") or {}
+    p = get_params(scenario)
+    conf = get_transient_conf(tr, p)
+    keyframes = normalize_keyframes(tr.get("keyframes"), conf["dt"], conf["duration"])
+    if conf["emptyInertia"] <= 0:
+        return {"ok": False, "error": "空盘惯量须大于 0。"}
+    if conf["axialStiffness"] <= 0:
+        return {"ok": False, "error": "电缆轴向刚度 EA 须大于 0。"}
+    geom = transient_geometry(scenario)
+
+    speed_pts, brake_pts = build_commands(keyframes, conf)
+    intervals = build_intervals(keyframes, conf)
+    for iv in intervals:
+        iv["hash"] = interval_hash(iv, keyframes, conf, p, geom)
+    hashes = [iv["hash"] for iv in intervals]
+
+    locked_count = int(clamp(num(data.get("lockedCount"), 0), 0, len(intervals)))
+    verified = data.get("verifiedHashes") or []
+    start_state = data.get("startState") or None
+
+    for idx in range(locked_count):
+        if idx >= len(verified) or verified[idx] != hashes[idx]:
+            ivs = [dict(j, status=("locked" if k < idx else "pending"))
+                   for k, j in enumerate(intervals)]
+            return {"ok": True, "status": "lock-changed",
+                    "intervals": ivs, "lockIntervalIndex": idx,
+                    "error": "已确认时段 %d 的输入（关键帧或制动参数）发生变化，请解锁后重算。" % (idx + 1)}
+
+    if locked_count > 0 and start_state and locked_count < len(intervals):
+        start_time = intervals[locked_count]["start"]
+        if abs(num(start_state.get("t"), -1) - start_time) > conf["dt"] * 1.5:
+            start_time, start_state = 0.0, None
+    else:
+        start_time, start_state = 0.0, None
+
+    rows, conflict, end_state = integrate_transient(
+        conf, p, geom, keyframes, speed_pts, brake_pts, start_time, start_state)
+
+    computed_from = 0 if start_state is None else locked_count
+    failed_index = None
+    for j, iv in enumerate(intervals):
+        if j < locked_count:
+            iv["status"] = "locked"
+        elif conflict is not None and conflict["time"] >= iv["start"] - 1e-9 \
+                and conflict["time"] <= iv["end"] + 1e-9:
+            iv["status"], failed_index = "failed", j
+        elif conflict is None or conflict["time"] > iv["end"] + 1e-9:
+            iv["status"] = "success"
+        else:
+            iv["status"] = "pending"
+
+    if conflict is not None:
+        status, new_locked = "blocked", failed_index
+    else:
+        status, new_locked = "passed", len(intervals)
+
+    summary = {
+        "duration": conf["duration"], "dt": conf["dt"],
+        "maxTension": round(max(r["tension"] for r in rows), 1),
+        "allowTension": p["allowTension"],
+        "maxOmega": round(max(abs(r["omega"]) for r in rows), 3),
+        "omegaLimit": conf["brakeMaxSpeed"],
+        "maxRpm": round(max(r["rpm"] for r in rows), 1),
+        "rpmLimit": round(conf["brakeMaxSpeed"] * 60.0 / (2 * math.pi), 1),
+        "maxHeatRatio": round(max(r["heatRatio"] for r in rows), 3),
+        "maxSlack": round(max(r["slack"] for r in rows), 3),
+        "slackClearance": conf["slackClearance"],
+        "brakeEnergy": rows[-1]["brakeEnergy"],
+        "brakeHeatCapacity": conf["brakeHeatCapacity"],
+        "reserveLeft": rows[-1]["reserve"],
+    }
+    return {
+        "ok": True, "status": status, "rows": rows, "intervals": intervals,
+        "hashes": hashes, "lockedCount": new_locked,
+        "verifiedHashes": hashes[:new_locked],
+        "failedInterval": failed_index, "conflict": conflict,
+        "startState": end_state if status == "blocked" else None,
+        "endState": end_state, "fromInterval": computed_from, "fromTime": rows[0]["t"],
+        "keyframes": keyframes, "brakeCurve": conf["brakeCurve"],
+        "config": {
+            "emptyInertia": conf["emptyInertia"], "bearingTorque": conf["bearingTorque"],
+            "reserveCable": conf["reserveCable"], "axialStiffness": conf["axialStiffness"],
+            "slackClearance": conf["slackClearance"], "brakeMaxSpeed": conf["brakeMaxSpeed"],
+            "brakeHeatCapacity": conf["brakeHeatCapacity"],
+            "windingPack": conf["windingPack"],
+            "startSpeed": conf["startSpeed"], "duration": conf["duration"], "dt": conf["dt"],
+        },
+        "geometry": geom, "summary": summary,
+    }
+
+
 # ----------------------------- 归档输出 -----------------------------
 
 def init_db():
@@ -940,6 +1463,10 @@ def init_db():
             result_json TEXT NOT NULL
         )
     """)
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(archives)").fetchall()}
+    for column, decl in (("transient_json", "TEXT"), ("transient_result_json", "TEXT")):
+        if column not in existing:
+            conn.execute("ALTER TABLE archives ADD COLUMN %s %s" % (column, decl))
     conn.commit()
     conn.close()
 
@@ -1213,6 +1740,193 @@ def build_recalc_json(scenario, result):
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def build_transient_csv(transient, tr, archive=None):
+    """逐时 CSV：输入指令曲线 + 计算值 + 人工说明。"""
+    cfg = tr.get("config") or {}
+    rows = tr.get("rows") or []
+    headers = ["time_s", "cmd_speed_mps", "reel_speed_mps", "speed_gap_mps",
+               "wind_radius_m", "shaft_omega_radps", "shaft_rpm",
+               "cable_tension_N", "inertia_tension_N",
+               "brake_cmd", "brake_torque_Nm", "brake_energy_J", "brake_heat_J",
+               "slack_loop_m", "reserve_cable_m", "line_station_m"]
+    lines = ["# 放盘—牵引联动逐时复算"]
+    lines.append("# 版本：%s" % (archive or {}).get("name", ""))
+    lines.append("# 人工说明：%s" % ((archive or {}).get("note") or "无"))
+    lines.append("# 输入：空盘惯量=%.1f kg·m²；轴承阻力矩=%.1f N·m；初始余缆=%.1f m；"
+                 "轴向刚度EA=%.0f N；制动热容量=%.0f J；制动转速上限=%.2f rad/s；净空=%.2f m"
+                 % (cfg.get("emptyInertia", 0), cfg.get("bearingTorque", 0),
+                    cfg.get("reserveCable", 0), cfg.get("axialStiffness", 0),
+                    cfg.get("brakeHeatCapacity", 0), cfg.get("brakeMaxSpeed", 0),
+                    cfg.get("slackClearance", 0)))
+    lines.append("# 输入指令—扭矩曲线：" + ";".join(
+        "%.2f→%.0fN·m" % (q[0], q[1]) for q in (tr.get("brakeCurve") or [])))
+    lines.append("# 关键帧：" + ";".join(
+        "%s@%.1fs v=%.2f" % (k.get("type"), k.get("time", 0), k.get("speed", 0))
+        for k in (tr.get("keyframes") or [])))
+    c = tr.get("conflict")
+    if c:
+        lines.append("# 最早冲突：t=%.2fs %s；%s" % (
+            c["time"], c["title"], c["message"]))
+    lines.append(",".join(headers))
+    for r in rows:
+        lines.append("%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.1f,%.1f,%.1f,%.3f,%.1f,%.1f,%.1f,%.3f,%.3f,%.3f" % (
+            r["t"], r["vCmd"], r["vReel"], r["dv"], r["radius"], r["omega"], r["rpm"],
+            r["tension"], r["inertiaTension"], r["brakeCmd"], r["brakeTorque"],
+            r["brakeEnergy"], r["brakeHeat"], r["slack"], r["reserve"], r["station"]))
+    return "\n".join(lines) + "\n"
+
+
+def build_transient_svg(transient, tr, archive=None):
+    """瞬态曲线 SVG：速度/转速/张力/制动/松弛五条曲线 + 关键帧与冲突标记。"""
+    rows = tr.get("rows") or []
+    width = 980
+    panels = [
+        ("速度 m/s", [("vCmd", "#475569", "指令速度"), ("vReel", "#2563eb", "盘轴线速度")], None),
+        ("盘轴转速 r/min", [("rpm", "#7c3aed", "转速")],
+         (tr.get("summary") or {}).get("omegaLimit", 0) * 60 / (2 * math.pi)),
+        ("张力 N", [("tension", "#f97316", "电缆张力"),
+                   ("inertiaTension", "#dc2626", "惯性附加张力")],
+         (tr.get("summary") or {}).get("allowTension")),
+        ("制动 J / 指令", [("brakeHeat", "#dc2626", "累计储热")],
+         (tr.get("config") or {}).get("brakeHeatCapacity")),
+        ("松弛圈 m", [("slack", "#16a34a", "松弛长度")],
+         (tr.get("config") or {}).get("slackClearance")),
+    ]
+    ph = 150
+    height = 60 + ph * len(panels) + 70
+    x0, pw = 70, 760
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" '
+             'font-family="Arial, &quot;Microsoft YaHei&quot;, sans-serif">'
+             % (width, height, width, height)]
+    parts.append('<rect width="%d" height="%d" fill="#f8fafc"/>' % (width, height))
+    name = escape_xml((archive or {}).get("name") or "放盘—牵引联动瞬态复算")
+    parts.append('<text x="20" y="28" font-size="18" font-weight="bold">%s</text>' % name)
+    note = (archive or {}).get("note") or ""
+    if note:
+        parts.append('<text x="20" y="48" font-size="11" fill="#475569">人工说明：%s</text>'
+                     % escape_xml(note[:90]))
+    t_end = (tr.get("config") or {}).get("duration") or (rows[-1]["t"] if rows else 1)
+    conflict = tr.get("conflict")
+
+    for pi, (title, series, limit) in enumerate(panels):
+        y0 = 70 + pi * ph
+        parts.append('<rect x="%d" y="%d" width="%d" height="%d" fill="#fff" stroke="#e2e8f0"/>'
+                     % (x0, y0, pw, ph - 18))
+        parts.append('<text x="14" y="%d" font-size="12" font-weight="bold">%s</text>'
+                     % (y0 + 16, title))
+        for gi in range(5):
+            gy = y0 + (ph - 18) * gi / 4
+            parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#f1f5f9"/>'
+                         % (x0, gy, x0 + pw, gy))
+        allvals = [r[k] for r in rows for k, _, _ in series]
+        if limit is not None:
+            allvals.append(limit)
+        vmin, vmax = min(allvals or [0]), max(allvals or [1])
+        if abs(vmax - vmin) < 1e-9:
+            vmax += 1.0
+        pad = (vmax - vmin) * 0.08
+        vmin, vmax = vmin - pad, vmax + pad
+
+        def xy(r, key):
+            x = x0 + pw * r["t"] / max(t_end, 1e-9)
+            y = y0 + (ph - 18) * (1 - (r[key] - vmin) / (vmax - vmin))
+            return x, y
+
+        for key, color, _label in series:
+            pts = " ".join("%.1f,%.1f" % xy(r, key) for r in rows)
+            parts.append('<polyline points="%s" fill="none" stroke="%s" stroke-width="1.6"/>'
+                         % (pts, color))
+        if limit is not None:
+            ly = y0 + (ph - 18) * (1 - (limit - vmin) / (vmax - vmin))
+            parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" '
+                         'stroke="#dc2626" stroke-width="1.1" stroke-dasharray="5 4"/>'
+                         % (x0, ly, x0 + pw, ly))
+            parts.append('<text x="%d" y="%.1f" font-size="10" fill="#dc2626">限值 %.3g</text>'
+                         % (x0 + pw - 64, ly - 3, limit))
+        for kf in (tr.get("keyframes") or []):
+            kx = x0 + pw * kf["time"] / max(t_end, 1e-9)
+            col = {"jog": "#0ea5e9", "speed": "#2563eb", "estop": "#dc2626"}.get(kf["type"], "#64748b")
+            parts.append('<line x1="%.1f" y1="%d" x2="%.1f" y2="%d" stroke="%s" '
+                         'stroke-width="1" stroke-dasharray="2 3"/>'
+                         % (kx, y0, kx, y0 + ph - 18, col))
+        if conflict:
+            cx = x0 + pw * conflict["time"] / max(t_end, 1e-9)
+            parts.append('<line x1="%.1f" y1="%d" x2="%.1f" y2="%d" stroke="#dc2626" stroke-width="1.6"/>'
+                         % (cx, y0, cx, y0 + ph - 18))
+        lx = x0 + 8
+        for key, color, label in series:
+            parts.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="%s" stroke-width="2.5"/>'
+                         % (lx, y0 + ph - 26, lx + 16, y0 + ph - 26, color))
+            parts.append('<text x="%d" y="%d" font-size="11" fill="#334155">%s</text>'
+                         % (lx + 20, y0 + ph - 22, label))
+            lx += 24 + len(label) * 12
+
+    axis_y = 70 + ph * len(panels) - 8
+    for s in range(11):
+        tt = t_end * s / 10
+        xx = x0 + pw * s / 10
+        parts.append('<line x1="%.1f" y1="%d" x2="%.1f" y2="%d" stroke="#94a3b8"/>'
+                     % (xx, axis_y - 6, xx, axis_y))
+        parts.append('<text x="%.1f" y="%d" font-size="10" fill="#64748b" text-anchor="middle">%.0fs</text>'
+                     % (xx, axis_y + 12, tt))
+    legend_y = axis_y + 34
+    for i, (ktype, c, label) in enumerate((("jog", "#0ea5e9", "点动"),
+                                            ("speed", "#2563eb", "换速"),
+                                            ("estop", "#dc2626", "急停"))):
+        lx = 20 + i * 120
+        parts.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="%s" stroke-width="2"/>'
+                     % (lx, legend_y, lx + 20, legend_y, c))
+        parts.append('<text x="%d" y="%d" font-size="11">%s</text>' % (lx + 25, legend_y + 4, label))
+    if conflict:
+        parts.append('<text x="380" y="%d" font-size="12" fill="#dc2626" font-weight="bold">'
+                     '最早冲突 t=%.2fs：%s</text>'
+                     % (legend_y, conflict["time"], escape_xml(conflict["title"])))
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def build_transient_recalc_json(scenario, transient, tr, archive=None):
+    p = get_params(scenario)
+    payload = {
+        "schemaVersion": 1,
+        "generator": "wsgiref + json + sqlite3 cable rigging transient model",
+        "archive": {"name": (archive or {}).get("name"), "note": (archive or {}).get("note"),
+                    "createdAt": (archive or {}).get("created_at")},
+        "units": {"length": "m", "time": "s", "angle": "rad", "force": "N",
+                  "torque": "N·m", "energy": "J", "stiffness": "N"},
+        "formulas": {
+            "windRadius": "r = sqrt(r_barrel^2 + L_reserve*d_cable^2/(4*pack))",
+            "slackTension": "slack>0 → T=T0; else dT = EA/L_eff*(v_pull-v_reel)*dt; T<T0 → 转入松弛",
+            "reelRotation": "(I0 + m/L*L_reserve*r^2)*dω = T*r - M_brake(cmd) - M_bearing",
+            "inertiaTension": "dT_inertia = I*alpha/r",
+            "brakeHeat": "E += M_brake*|ω|*dt（无冷却假设，全部储热）",
+            "reserve": "L_reserve = L0 - ∫ω*r dt",
+            "slackLoop": "s += (v_reel-v_pull)*dt（盘轴甩出松弛）",
+        },
+        "input": {
+            "params": p,
+            "emptyInertia": (tr.get("config") or {}).get("emptyInertia"),
+            "bearingTorque": (tr.get("config") or {}).get("bearingTorque"),
+            "reserveCable": (tr.get("config") or {}).get("reserveCable"),
+            "axialStiffness": (tr.get("config") or {}).get("axialStiffness"),
+            "slackClearance": (tr.get("config") or {}).get("slackClearance"),
+            "brakeMaxSpeed": (tr.get("config") or {}).get("brakeMaxSpeed"),
+            "brakeHeatCapacity": (tr.get("config") or {}).get("brakeHeatCapacity"),
+            "brakeCommandTorqueCurve": tr.get("brakeCurve"),
+            "keyframes": tr.get("keyframes"),
+        },
+        "computed": {
+            "rows": tr.get("rows"),
+            "intervals": tr.get("intervals"),
+            "conflict": tr.get("conflict"),
+            "summary": tr.get("summary"),
+            "geometry": tr.get("geometry"),
+        },
+        "manualNote": (archive or {}).get("note") or "",
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 # ----------------------------- HTTP 路由 -----------------------------
 
 def json_response(start_response, obj, status="200 OK"):
@@ -1260,9 +1974,15 @@ def fetch_archive(conn, archive_id):
     row = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
     if not row:
         return None
+    cols = [d[0] for d in conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).description]
+    rec = dict(zip(cols, row))
     return {
-        "id": row[0], "created_at": row[1], "name": row[2], "note": row[3],
-        "scenario": json.loads(row[4]), "result": json.loads(row[5]),
+        "id": rec["id"], "created_at": rec["created_at"], "name": rec["name"],
+        "note": rec["note"],
+        "scenario": json.loads(rec["scenario_json"]),
+        "result": json.loads(rec["result_json"]),
+        "transient": json.loads(rec.get("transient_json") or "null"),
+        "transientResult": json.loads(rec.get("transient_result_json") or "null"),
     }
 
 
@@ -1277,16 +1997,26 @@ def app(environ, start_response):
                               data.get("verifiedHashes") or [])
             return json_response(start_response, result)
 
+        if path == "/api/transient/simulate" and method == "POST":
+            data = read_json(environ)
+            result = simulate_transient(data)
+            return json_response(start_response, result)
+
         if path == "/api/archives" and method == "GET":
             conn = sqlite3.connect(DB_PATH)
-            rows = conn.execute("SELECT id,created_at,name,note,result_json FROM archives ORDER BY id DESC").fetchall()
+            rows = conn.execute(
+                "SELECT id,created_at,name,note,result_json,transient_result_json "
+                "FROM archives ORDER BY id DESC").fetchall()
             conn.close()
             items = []
             for r in rows:
                 result = json.loads(r[4])
+                tr = json.loads(r[5]) if len(r) > 5 and r[5] else None
                 items.append({"id": r[0], "createdAt": r[1], "name": r[2], "note": r[3],
                               "status": result.get("status"),
                               "failedIndex": result.get("failedIndex"),
+                              "hasTransient": bool(tr),
+                              "transientStatus": (tr or {}).get("status"),
                               "summary": result.get("summary")})
             return json_response(start_response, {"items": items})
 
@@ -1294,17 +2024,28 @@ def app(environ, start_response):
             data = read_json(environ)
             scenario = data.get("scenario") or {}
             result = simulate(scenario)
+            transient_in = data.get("transient")
+            transient = transient_in if isinstance(transient_in, dict) and transient_in else None
+            transient_result = None
+            if transient is not None:
+                transient_result = simulate_transient(
+                    {"scenario": scenario, "transient": transient})
             name = (data.get("name") or "未命名推演版本").strip()
             note = data.get("note") or ""
             conn = sqlite3.connect(DB_PATH)
             cur = conn.execute(
-                "INSERT INTO archives(name,note,scenario_json,result_json) VALUES(?,?,?,?)",
+                "INSERT INTO archives(name,note,scenario_json,result_json,"
+                "transient_json,transient_result_json) VALUES(?,?,?,?,?,?)",
                 (name, note, json.dumps(scenario, ensure_ascii=False),
-                 json.dumps(result, ensure_ascii=False)))
+                 json.dumps(result, ensure_ascii=False),
+                 json.dumps(transient, ensure_ascii=False) if transient else None,
+                 json.dumps(transient_result, ensure_ascii=False) if transient_result else None))
             conn.commit()
             archive_id = cur.lastrowid
             conn.close()
-            return json_response(start_response, {"id": archive_id, "result": result})
+            return json_response(start_response,
+                                 {"id": archive_id, "result": result,
+                                  "transientResult": transient_result})
 
         if path.startswith("/api/archives/"):
             parts = [p for p in path.split("/") if p]
@@ -1323,6 +2064,8 @@ def app(environ, start_response):
                     "id": archive["id"], "createdAt": archive["created_at"],
                     "name": archive["name"], "note": archive["note"],
                     "scenario": archive["scenario"], "result": archive["result"],
+                    "transient": archive["transient"],
+                    "transientResult": archive["transientResult"],
                 })
             if len(parts) == 4 and method == "GET":
                 kind = parts[3]
@@ -1343,6 +2086,27 @@ def app(environ, start_response):
                                          build_recalc_json(archive["scenario"], archive["result"]),
                                          "application/json; charset=utf-8",
                                          filename="cable-recalc-%d.json" % archive_id)
+                if kind == "transient-csv" and archive["transientResult"]:
+                    conn.close()
+                    return text_response(start_response,
+                                         build_transient_csv(archive["transient"],
+                                                             archive["transientResult"], archive),
+                                         "text/csv; charset=utf-8",
+                                         filename="reel-transient-%d.csv" % archive_id)
+                if kind == "transient-svg" and archive["transientResult"]:
+                    conn.close()
+                    svg = build_transient_svg(archive["transient"],
+                                              archive["transientResult"], archive)
+                    return text_response(start_response, svg, "image/svg+xml; charset=utf-8",
+                                         filename="reel-transient-%d.svg" % archive_id)
+                if kind == "transient-json" and archive["transientResult"]:
+                    conn.close()
+                    return text_response(start_response,
+                                         build_transient_recalc_json(
+                                             archive["scenario"], archive["transient"],
+                                             archive["transientResult"], archive),
+                                         "application/json; charset=utf-8",
+                                         filename="reel-transient-%d.json" % archive_id)
             conn.close()
 
         if method == "GET":

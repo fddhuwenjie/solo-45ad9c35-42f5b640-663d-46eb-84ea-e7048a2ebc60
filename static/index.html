@@ -12,14 +12,18 @@
     <h1>电缆盘进场与放缆推演</h1>
     <p>平面 / 纵剖面描线 · 滚运转向 · 架设牵引 · 首次受阻停帧 · 已核实区段锁定</p>
   </div>
-  <div class="top-actions">
+  <nav class="tabs" id="viewTabs">
+    <button data-view="static" class="tab active">静力逐段推演</button>
+    <button data-view="transient" class="tab">放盘—牵引联动</button>
+  </nav>
+  <div class="top-actions" id="staticActions">
     <button id="runBtn" class="primary">▶ 点击推演</button>
     <button id="continueBtn" class="success" disabled>继续演算</button>
     <button id="unlockBtn" disabled>解锁返工</button>
   </div>
 </header>
 
-<main class="layout">
+<main class="layout" id="staticView">
   <aside class="panel left">
     <section>
       <h2>1. 绘图工具</h2>
@@ -133,6 +137,112 @@
   </aside>
 </main>
 
+<main class="transient-view" id="transientView" hidden>
+  <aside class="panel tr-left">
+    <section>
+      <h2>联动设备登记</h2>
+      <div class="form" id="trParamForm">
+        <label>空盘转动惯量(kg·m²)<input type="number" step="any" data-k="emptyInertia"></label>
+        <label>轴承阻力矩(N·m)<input type="number" step="any" data-k="bearingTorque"></label>
+        <label>初始余缆(m)<input type="number" step="any" data-k="reserveCable"></label>
+        <label>电缆轴向刚度 EA(N)<input type="number" step="any" data-k="axialStiffness"></label>
+        <label>盘前松弛净空(m)<input type="number" step="any" data-k="slackClearance"></label>
+        <label>制动器转速上限(rad/s)<input type="number" step="any" data-k="brakeMaxSpeed"></label>
+        <label>制动器热容量(J)<input type="number" step="any" data-k="brakeHeatCapacity"></label>
+        <label>绕线装填系数<input type="number" step="any" data-k="windingPack"></label>
+        <label>演算时长(s)<input type="number" step="any" data-k="duration"></label>
+        <label>积分步长(s)<input type="number" step="any" data-k="dt"></label>
+      </div>
+      <p class="hint">盘径、筒径、电缆外径/单位重、初始张力、允许张力沿用“基础参数”页签中的登记值。</p>
+    </section>
+    <section>
+      <h2>制动器指令—扭矩曲线</h2>
+      <canvas id="trBrakeCanvas" width="300" height="180"></canvas>
+      <div id="trCurveRows" class="curve-rows"></div>
+      <div class="row">
+        <button id="trCurveAdd">＋ 增加控制点</button>
+        <button id="trCurveReset">恢复默认曲线</button>
+      </div>
+    </section>
+    <section>
+      <h2>关键帧登记</h2>
+      <div class="row">
+        <button data-add="jog">＋ 点动</button>
+        <button data-add="speed">＋ 换速</button>
+        <button data-add="estop">＋ 急停</button>
+      </div>
+      <ol id="trKfList" class="kf-list"></ol>
+    </section>
+  </aside>
+
+  <section class="stage">
+    <div class="canvas-card">
+      <div class="canvas-head">
+        <div><h2>时间轴：拖动点动 / 换速 / 急停关键帧</h2>
+          <span class="statusline">横向拖动改变时刻；颜色：蓝=换速 青=点动 红=急停</span></div>
+        <div class="tr-controls">
+          <button id="trRunBtn" class="primary">▶ 逐时复算</button>
+          <button id="trContinueBtn" class="success" disabled>仅重算波及时段</button>
+          <button id="trUnlockBtn" disabled>解锁已确认时段</button>
+        </div>
+      </div>
+      <div class="svg-wrap">
+        <svg id="trTimelineSvg" viewBox="0 0 900 210" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
+    <div class="canvas-card">
+      <div class="canvas-head">
+        <div><h2>逐时曲线：指令/盘速 · 转速 · 张力 · 制动储热 · 松弛</h2></div>
+        <div class="playcontrols tr-play">
+          <button id="trPauseBtn" disabled>⏸ 暂停</button>
+          <label>回放速度<input id="trSpeedInput" type="range" min="0.25" max="3" step="0.05" value="1"></label>
+        </div>
+      </div>
+      <canvas id="trChartCanvas" width="1080" height="430"></canvas>
+    </div>
+    <div class="canvas-card tr-anim-card">
+      <div class="canvas-head">
+        <div><h2>线路动画：盘架—导向—牵引机瞬时状态</h2>
+          <span class="statusline">红=张力/冲突，绿=松弛圈，盘上数字为卷绕半径与转速</span></div>
+      </div>
+      <svg id="trAnimSvg" viewBox="0 0 42 15" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+    <div class="telemetry tr-telemetry">
+      <div><label>时刻</label><strong id="trTeleTime">-</strong></div>
+      <div><label>卷绕半径</label><strong id="trTeleRadius">-</strong></div>
+      <div><label>盘轴转速</label><strong id="trTeleOmega">-</strong></div>
+      <div><label>收放线速度差</label><strong id="trTeleDv">-</strong></div>
+      <div><label>电缆张力</label><strong id="trTeleTension">-</strong></div>
+      <div><label>惯性附加张力</label><strong id="trTeleInertia">-</strong></div>
+      <div><label>制动耗能/储热</label><strong id="trTeleHeat">-</strong></div>
+      <div><label>松弛长度</label><strong id="trTeleSlack">-</strong></div>
+      <div><label>剩余余缆</label><strong id="trTeleReserve">-</strong></div>
+      <div><label>判定</label><strong id="trTeleState">-</strong></div>
+    </div>
+    <div id="trMessageBar" class="message info">登记空盘惯量、轴承阻力、余缆与轴向刚度，在时间轴上拖入点动、换速和急停关键帧后点击“逐时复算”。</div>
+  </section>
+
+  <aside class="panel tr-right">
+    <section>
+      <h2>时段确认与冲突</h2>
+      <ol id="trIntervalList" class="checkpoints"></ol>
+    </section>
+    <section>
+      <h2>联动版本输出</h2>
+      <label>版本名称<input id="trArchiveName" placeholder="例如：左线首盘-联动复测-20260914"></label>
+      <label>人工说明<textarea id="trArchiveNote" rows="3" placeholder="制动曲线来源、现场复测、交底人、异常处置等"></textarea></label>
+      <button id="trArchiveBtn" class="primary wide">归档联动版本（含静力+瞬态）</button>
+      <div class="outputs">
+        <button id="trCsvBtn" disabled>逐时 CSV</button>
+        <button id="trSvgBtn" disabled>曲线 SVG</button>
+        <button id="trJsonBtn" disabled>复算 JSON</button>
+      </div>
+      <div id="trArchiveList" class="archive-list"></div>
+    </section>
+  </aside>
+</main>
+
 <script src="app.js"></script>
+<script src="transient.js"></script>
 </body>
 </html>

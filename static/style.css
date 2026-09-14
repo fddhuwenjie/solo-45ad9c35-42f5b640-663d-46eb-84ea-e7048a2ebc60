@@ -120,3 +120,41 @@ input:focus, select:focus, textarea:focus { outline: 2px solid rgba(37,99,235,.2
   .panel.right { grid-column: 1 / -1; max-height: none; }
   .telemetry { grid-template-columns: repeat(4,1fr); }
 }
+
+/* ---------------- 页签与放盘—牵引联动工作区 ---------------- */
+.tabs { display: flex; gap: 6px; margin: 0 18px; }
+.tab { background: rgba(255,255,255,.08); border-color: rgba(255,255,255,.25); color: #e2e8f0; border-radius: 8px; }
+.tab:hover:not(:disabled) { background: rgba(255,255,255,.16); color: #fff; }
+.tab.active { background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 700; }
+.transient-view {
+  display: grid; grid-template-columns: 300px minmax(0,1fr) 330px;
+  gap: 14px; padding: 14px; align-items: start;
+}
+.transient-view .panel { max-height: calc(100vh - 100px); }
+#trTimelineSvg { width: 100%; height: 230px; display: block; touch-action: none; user-select: none; }
+#trChartCanvas { width: 100%; height: 430px; border: 1px solid #e2e8f0; border-radius: 10px; background: #fff; display: block; }
+#trBrakeCanvas { width: 100%; height: 180px; border: 1px solid #e2e8f0; border-radius: 8px; background: #fbfdff; touch-action: none; cursor: crosshair; }
+#trAnimSvg { width: 100%; height: 260px; display: block; }
+.curve-rows { display: grid; gap: 4px; margin-top: 8px; }
+.curve-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; align-items: end; }
+.curve-row button { padding: 4px 8px; }
+.kf-list { list-style: none; padding: 0; margin: 8px 0 0; display: grid; gap: 6px; max-height: 300px; overflow: auto; }
+.kf-item { border: 1px solid var(--line); border-left-width: 4px; border-radius: 8px; padding: 7px; cursor: pointer; background: #fff; }
+.kf-item.jog { border-left-color: #0ea5e9; }
+.kf-item.speed { border-left-color: #2563eb; }
+.kf-item.estop { border-left-color: #dc2626; }
+.kf-item.active { outline: 2px solid rgba(249,115,22,.55); }
+.kf-item label { font-size: 11px; margin-top: 4px; }
+.tr-controls { display: flex; gap: 6px; flex-wrap: wrap; }
+.tr-controls button { padding: 6px 10px; }
+.tr-play { display: flex; gap: 8px; align-items: center; }
+.tr-play label { flex-direction: row; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.tr-telemetry { grid-template-columns: repeat(5, minmax(0,1fr)); }
+.tr-telemetry strong { font-size: 12px; }
+.tr-right .outputs { grid-template-columns: repeat(3,1fr); }
+.tr-right .outputs button { padding: 6px 4px; font-size: 12px; }
+@media (max-width: 1280px) {
+  .transient-view { grid-template-columns: 290px minmax(0,1fr); }
+  .tr-right { grid-column: 1 / -1; max-height: none; }
+  .tr-telemetry { grid-template-columns: repeat(3,1fr); }
+}
